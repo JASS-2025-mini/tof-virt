@@ -1,6 +1,4 @@
 ```
-sudo apt-get install pigpio
-sudo systemctl start pigpiod
-sudo systemctl enable pigpiod
-sudo apt-get install wiringpi
+sudo apt-get install libgpiod-dev gpiod
+
 ```

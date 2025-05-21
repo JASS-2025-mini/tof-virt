@@ -85,7 +85,7 @@ int main(int argc, char *argv[]) {
         }
         
         // Wait a second before next ping
-        sleep(2);
+        sleep(10);
     }
     
     printf("Cleaning up...\n");

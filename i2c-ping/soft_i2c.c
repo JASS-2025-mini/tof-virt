@@ -23,7 +23,8 @@ int i2c_init(I2C_Config *config) {
     
     // Default bit delay if not specified
     if (config->bit_delay == 0) {
-        config->bit_delay = 1000;  // 1000 microseconds default for reliability
+        // config->bit_delay = 1000;  // 1000 microseconds default for reliability
+        config->bit_delay = 10;
     }
     
     // Enable internal pull-up resistors
@@ -356,7 +357,9 @@ int i2c_slave_read_byte_with_stop_check(I2C_Config *config, uint8_t *byte) {
     int i;
     *byte = 0;
     
-    printf("DEBUG: i2c_slave_read_byte_with_stop_check - Starting\n");
+    /// Todo
+    config->bit_delay=10;
+    printf("!DEBUG: i2c_slave_read_byte_with_stop_check, bit_delay: %d - Starting\n", config->bit_delay);
     
     sda_set_mode(config, PI_INPUT);
     gpioSetMode(config->scl_pin, PI_INPUT);
@@ -387,7 +390,7 @@ int i2c_slave_read_byte_with_stop_check(I2C_Config *config, uint8_t *byte) {
         
         // Read bit
         int bit = gpioRead(config->sda_pin);
-        printf("DEBUG: i2c_slave_read_byte_with_stop_check - Bit %d = %d\n", i, bit);
+        printf("DEBUG: i2c_slave_read_byte_with_stop_check - Bit %d = %d, bit_delay: %d\n", i, bit, config->bit_delay);
         
         if (bit) {
             *byte |= (1 << i);

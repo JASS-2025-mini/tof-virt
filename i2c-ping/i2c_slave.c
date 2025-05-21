@@ -91,7 +91,7 @@ int main(int argc, char *argv[]) {
             printf("Sending: %s\n", send_buffer);
             
             // Small delay to allow master to prepare for reading
-            usleep(10000);  // 10ms delay
+            // usleep(10000);  // 10ms delay
             
             printf("DEBUG: main - Waiting for master to request data\n");
             
@@ -109,7 +109,7 @@ int main(int argc, char *argv[]) {
                 }
                 
                 // Failed to send, wait a bit and try again
-                usleep(10000);  // 10ms
+                // usleep(10000);  // 10ms
                 waited += 10;
             }
             
