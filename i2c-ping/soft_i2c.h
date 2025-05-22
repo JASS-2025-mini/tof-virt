@@ -3,7 +3,7 @@
 #define SOFT_I2C_H
 
 #include <stdint.h>
-#include <pigpio.h>
+#include <gpiod.h>
 #include <time.h>
 
 // Configuration for pins
@@ -12,13 +12,18 @@ typedef struct {
     int scl_pin;  // Clock pin
     uint8_t slave_address;  // I2C slave address
     int bit_delay;  // Delay in microseconds between bit operations
+    
+    // GPIO handles (internal)
+    struct gpiod_chip *chip;
+    struct gpiod_line *sda_line;
+    struct gpiod_line *scl_line;
 } I2C_Config;
 
 // Initialize software I2C with given configuration
 int i2c_init(I2C_Config *config);
 
 // Clean up resources
-void i2c_cleanup(void);
+void i2c_cleanup(I2C_Config *config);
 
 // Master functions
 int i2c_start(I2C_Config *config);

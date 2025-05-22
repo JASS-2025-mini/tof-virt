@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g
-LDFLAGS = -lpigpio -lrt -pthread
+LDFLAGS = -lgpiod
 
 all: i2c_master i2c_slave
 

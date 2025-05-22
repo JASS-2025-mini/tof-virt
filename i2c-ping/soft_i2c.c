@@ -4,72 +4,134 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <string.h>
+#include <errno.h>
 
-// Initialize GPIO 
+// Initialize GPIO using libgpiod
 int i2c_init(I2C_Config *config) {
-    // Initialize pigpio library
-    if (gpioInitialise() < 0) {
-        fprintf(stderr, "Failed to initialize GPIO\n");
+    // Open GPIO chip (usually gpiochip0 on most systems)
+    config->chip = gpiod_chip_open_by_name("gpiochip0");
+    if (!config->chip) {
+        // Try alternative chip names
+        config->chip = gpiod_chip_open_by_name("gpiochip1");
+        if (!config->chip) {
+            fprintf(stderr, "Failed to open GPIO chip\n");
+            return -1;
+        }
+    }
+    
+    // Get GPIO lines
+    config->sda_line = gpiod_chip_get_line(config->chip, config->sda_pin);
+    config->scl_line = gpiod_chip_get_line(config->chip, config->scl_pin);
+    
+    if (!config->sda_line || !config->scl_line) {
+        fprintf(stderr, "Failed to get GPIO lines\n");
+        gpiod_chip_close(config->chip);
         return -1;
     }
-
-    // Configure pins
-    gpioSetMode(config->sda_pin, PI_OUTPUT);
-    gpioSetMode(config->scl_pin, PI_OUTPUT);
     
-    // Set pins to high (idle state)
-    gpioWrite(config->sda_pin, 1);
-    gpioWrite(config->scl_pin, 1);
-    
-    // Default bit delay if not specified
-    if (config->bit_delay == 0) {
-        // config->bit_delay = 1000;  // 1000 microseconds default for reliability
-        config->bit_delay = 10;
+    // Configure pins as open-drain outputs with pull-up (I2C standard)
+    printf("DEBUG: Requesting SDA line (GPIO%d) as open-drain with pull-up\n", config->sda_pin);
+    if (gpiod_line_request_output_flags(config->sda_line, "i2c_sda", 
+                                        GPIOD_LINE_REQUEST_FLAG_OPEN_DRAIN | 
+                                        GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP, 1) < 0) {
+        fprintf(stderr, "Failed to configure SDA line (GPIO%d) as open-drain: %s\n", 
+                config->sda_pin, strerror(errno));
+        gpiod_chip_close(config->chip);
+        return -1;
     }
     
-    // Enable internal pull-up resistors
-    gpioSetPullUpDown(config->sda_pin, PI_PUD_UP);
-    gpioSetPullUpDown(config->scl_pin, PI_PUD_UP);
+    printf("DEBUG: Requesting SCL line (GPIO%d) as open-drain with pull-up\n", config->scl_pin);
+    if (gpiod_line_request_output_flags(config->scl_line, "i2c_scl", 
+                                        GPIOD_LINE_REQUEST_FLAG_OPEN_DRAIN |
+                                        GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP, 1) < 0) {
+        fprintf(stderr, "Failed to configure SCL line (GPIO%d) as open-drain: %s\n", 
+                config->scl_pin, strerror(errno));
+        gpiod_chip_close(config->chip);
+        return -1;
+    }
+    
+    // Default bit delay if not specified  
+    if (config->bit_delay == 0) {
+        config->bit_delay = 2000;  // 2000 microseconds for better stability
+    }
+    
+    printf("GPIO initialized: SDA=GPIO%d, SCL=GPIO%d, bit_delay=%dus\n", 
+           config->sda_pin, config->scl_pin, config->bit_delay);
     
     return 0;
 }
 
-void i2c_cleanup(void) {
-    gpioTerminate();
+void i2c_cleanup(I2C_Config *config) {
+    if (config->sda_line) {
+        gpiod_line_release(config->sda_line);
+    }
+    if (config->scl_line) {
+        gpiod_line_release(config->scl_line);
+    }
+    if (config->chip) {
+        gpiod_chip_close(config->chip);
+    }
 }
 
 // Debug function to display pin status
 void i2c_debug_status(I2C_Config *config) {
-    int sda_state = gpioRead(config->sda_pin);
-    int scl_state = gpioRead(config->scl_pin);
+    int sda_state = gpiod_line_get_value(config->sda_line);
+    int scl_state = gpiod_line_get_value(config->scl_line);
     printf("DEBUG: SDA=%d, SCL=%d\n", sda_state, scl_state);
 }
 
-// Set SDA pin as input or output
+// Set SDA pin value (open-drain: 1=release line, 0=pull low)
 static void sda_set_mode(I2C_Config *config, int mode) {
-    gpioSetMode(config->sda_pin, mode);
-    if (mode == PI_OUTPUT) {
-        gpioWrite(config->sda_pin, 1);  // Pull high when setting as output
-    }
+    (void)mode; // With open-drain, we always just set value
+    // No mode switching needed with open-drain
+}
+
+// Set SCL pin value (open-drain: 1=release line, 0=pull low)  
+static void scl_set_mode(I2C_Config *config, int mode) {
+    (void)mode; // With open-drain, we always just set value
+    // No mode switching needed with open-drain
+}
+
+// Check if bus is idle (both SDA and SCL high)
+static int i2c_bus_is_idle(I2C_Config *config) {
+    // With open-drain, just read current values
+    usleep(config->bit_delay);
+    
+    int sda_state = gpiod_line_get_value(config->sda_line);
+    int scl_state = gpiod_line_get_value(config->scl_line);
+    
+    return (sda_state == 1 && scl_state == 1);
 }
 
 // Generate I2C start condition
 int i2c_start(I2C_Config *config) {
-    // Ensure SDA is output
-    printf("DEBUG: i2c_start - Setting SDA to output\n");
-    sda_set_mode(config, PI_OUTPUT);
+    // Wait for bus to be idle
+    printf("DEBUG: i2c_start - Checking bus idle state\n");
+    int retries = 10;
+    while (!i2c_bus_is_idle(config) && retries-- > 0) {
+        printf("DEBUG: i2c_start - Bus not idle, waiting...\n");
+        usleep(config->bit_delay * 10);
+    }
+    
+    if (retries <= 0) {
+        printf("DEBUG: i2c_start - Bus busy, proceeding anyway\n");
+    }
+    
+    // With open-drain, no mode switching needed
+    printf("DEBUG: i2c_start - Preparing START condition\n");
     
     // Ensure both lines are high
     printf("DEBUG: i2c_start - Setting both lines high\n");
-    gpioWrite(config->sda_pin, 1);
-    gpioWrite(config->scl_pin, 1);
-    gpioDelay(config->bit_delay);
+    gpiod_line_set_value(config->sda_line, 1);
+    gpiod_line_set_value(config->scl_line, 1);
+    usleep(config->bit_delay);
     
     // Generate start condition: SDA goes low while SCL is high
     printf("DEBUG: i2c_start - Generating START condition\n");
-    gpioWrite(config->sda_pin, 0);
-    gpioDelay(config->bit_delay);
-    gpioWrite(config->scl_pin, 0);
+    gpiod_line_set_value(config->sda_line, 0);
+    usleep(config->bit_delay);
+    gpiod_line_set_value(config->scl_line, 0);
     
     printf("DEBUG: i2c_start - START condition complete\n");
     
@@ -79,18 +141,18 @@ int i2c_start(I2C_Config *config) {
 // Generate I2C stop condition
 void i2c_stop(I2C_Config *config) {
     // Ensure SDA is output
-    sda_set_mode(config, PI_OUTPUT);
+    sda_set_mode(config, 0);
     
     // Prepare for stop: ensure SCL is low, then set SDA low
-    gpioWrite(config->scl_pin, 0);
-    gpioWrite(config->sda_pin, 0);
-    gpioDelay(config->bit_delay);
+    gpiod_line_set_value(config->scl_line, 0);
+    gpiod_line_set_value(config->sda_line, 0);
+    usleep(config->bit_delay);
     
     // Generate stop condition: SCL goes high, then SDA goes high
-    gpioWrite(config->scl_pin, 1);
-    gpioDelay(config->bit_delay);
-    gpioWrite(config->sda_pin, 1);
-    gpioDelay(config->bit_delay);
+    gpiod_line_set_value(config->scl_line, 1);
+    usleep(config->bit_delay);
+    gpiod_line_set_value(config->sda_line, 1);
+    usleep(config->bit_delay);
     
     printf("DEBUG: i2c_stop - STOP condition complete\n");
 }
@@ -102,7 +164,7 @@ int i2c_write_byte(I2C_Config *config, uint8_t byte) {
     
     printf("DEBUG: i2c_write_byte - Writing byte 0x%02X\n", byte);
     
-    sda_set_mode(config, PI_OUTPUT);
+    sda_set_mode(config, 0);
     
     // Send 8 bits, MSB first
     for (i = 7; i >= 0; i--) {
@@ -110,38 +172,38 @@ int i2c_write_byte(I2C_Config *config, uint8_t byte) {
         int bit = (byte >> i) & 1;
         printf("DEBUG: i2c_write_byte - Bit %d = %d\n", i, bit);
         
-        gpioWrite(config->sda_pin, bit);
-        gpioDelay(config->bit_delay);
+        gpiod_line_set_value(config->sda_line, bit);
+        usleep(config->bit_delay);
         
         // Clock high and delay
-        gpioWrite(config->scl_pin, 1);
-        gpioDelay(config->bit_delay * 2);
+        gpiod_line_set_value(config->scl_line, 1);
+        usleep(config->bit_delay * 2);
         
         // Clock low and delay
-        gpioWrite(config->scl_pin, 0);
-        gpioDelay(config->bit_delay);
+        gpiod_line_set_value(config->scl_line, 0);
+        usleep(config->bit_delay);
     }
     
     printf("DEBUG: i2c_write_byte - All bits sent, waiting for ACK\n");
     
     // Release SDA for slave acknowledgment
-    gpioWrite(config->sda_pin, 1);
-    sda_set_mode(config, PI_INPUT);
+    gpiod_line_set_value(config->sda_line, 1);
+    sda_set_mode(config, 1);
     
     // Clock high to read ACK bit
-    gpioWrite(config->scl_pin, 1);
-    gpioDelay(config->bit_delay);
+    gpiod_line_set_value(config->scl_line, 1);
+    usleep(config->bit_delay);
     
     // Read ACK bit (0 = acknowledged)
-    ack = gpioRead(config->sda_pin);
+    ack = gpiod_line_get_value(config->sda_line);
     printf("DEBUG: i2c_write_byte - ACK bit = %d (0=ACK, 1=NACK)\n", ack);
     
     // Clock low
-    gpioWrite(config->scl_pin, 0);
-    gpioDelay(config->bit_delay);
+    gpiod_line_set_value(config->scl_line, 0);
+    usleep(config->bit_delay);
     
     // Restore SDA as output
-    sda_set_mode(config, PI_OUTPUT);
+    sda_set_mode(config, 0);
     
     printf("DEBUG: i2c_write_byte - Returning %d\n", (ack == 0) ? 0 : -1);
     
@@ -156,34 +218,34 @@ uint8_t i2c_read_byte(I2C_Config *config, int ack) {
     printf("DEBUG: i2c_read_byte - Starting (ack=%d)\n", ack);
     
     // Release SDA so slave can control it
-    sda_set_mode(config, PI_INPUT);
+    sda_set_mode(config, 1);
     
     // Read 8 bits
     for (i = 7; i >= 0; i--) {
-        gpioWrite(config->scl_pin, 1);
-        gpioDelay(config->bit_delay);
+        gpiod_line_set_value(config->scl_line, 1);
+        usleep(config->bit_delay);
         
-        if (gpioRead(config->sda_pin)) {
+        if (gpiod_line_get_value(config->sda_line)) {
             byte |= (1 << i);
             printf("DEBUG: i2c_read_byte - Bit %d = 1\n", i);
         } else {
             printf("DEBUG: i2c_read_byte - Bit %d = 0\n", i);
         }
         
-        gpioWrite(config->scl_pin, 0);
-        gpioDelay(config->bit_delay);
+        gpiod_line_set_value(config->scl_line, 0);
+        usleep(config->bit_delay);
     }
     
     // Send ACK/NACK
-    sda_set_mode(config, PI_OUTPUT);
-    gpioWrite(config->sda_pin, ack ? 1 : 0); // 0 = ACK, 1 = NACK
+    sda_set_mode(config, 0);
+    gpiod_line_set_value(config->sda_line, ack ? 1 : 0); // 0 = ACK, 1 = NACK
     printf("DEBUG: i2c_read_byte - Sending %s\n", ack ? "NACK" : "ACK");
     
     // Clock ACK/NACK bit
-    gpioWrite(config->scl_pin, 1);
-    gpioDelay(config->bit_delay);
-    gpioWrite(config->scl_pin, 0);
-    gpioDelay(config->bit_delay);
+    gpiod_line_set_value(config->scl_line, 1);
+    usleep(config->bit_delay);
+    gpiod_line_set_value(config->scl_line, 0);
+    usleep(config->bit_delay);
     
     printf("DEBUG: i2c_read_byte - Read 0x%02X\n", byte);
     
@@ -206,55 +268,93 @@ int i2c_slave_listen(I2C_Config *config) {
     printf("DEBUG: Entering i2c_slave_listen\n");
     
     // Wait for START condition (SDA falling edge while SCL is high)
-    sda_set_mode(config, PI_INPUT);
-    gpioSetMode(config->scl_pin, PI_INPUT);
+    sda_set_mode(config, 1);
+    scl_set_mode(config, 1);
     
     printf("DEBUG: Set pins to input mode\n");
     
-    // Wait for both lines to be high (idle)
-    while (gpioRead(config->sda_pin) == 0 || gpioRead(config->scl_pin) == 0) {
+    // Wait for both lines to be high (idle) with timeout
+    int timeout_count = 0;
+    while ((gpiod_line_get_value(config->sda_line) == 0 || gpiod_line_get_value(config->scl_line) == 0) && timeout_count < 1000) {
         printf("DEBUG: Waiting for idle, SDA=%d, SCL=%d\n", 
-               gpioRead(config->sda_pin), gpioRead(config->scl_pin));
-        gpioDelay(config->bit_delay);
+               gpiod_line_get_value(config->sda_line), gpiod_line_get_value(config->scl_line));
+        usleep(config->bit_delay);
+        timeout_count++;
+    }
+    
+    if (timeout_count >= 1000) {
+        printf("DEBUG: Timeout waiting for idle state\n");
+        return -1;
     }
     
     printf("DEBUG: Detected idle state, waiting for START\n");
     
-    // Wait for SDA to go low while SCL is high (START condition)
-    while (gpioRead(config->sda_pin) == 1) {
-        if (gpioRead(config->scl_pin) == 0) {
+    // Wait for SDA to go low while SCL is high (START condition) with timeout
+    timeout_count = 0;
+    while (gpiod_line_get_value(config->sda_line) == 1 && timeout_count < 5000) {
+        if (gpiod_line_get_value(config->scl_line) == 0) {
             // SCL went low before SDA, not a START condition
             printf("DEBUG: SCL went low before SDA, not a START\n");
-            gpioDelay(config->bit_delay);
+            usleep(config->bit_delay);
+            timeout_count++;
             continue;
         }
-        gpioDelay(config->bit_delay);
+        usleep(config->bit_delay);
+        timeout_count++;
+    }
+    
+    if (timeout_count >= 5000) {
+        printf("DEBUG: Timeout waiting for START condition\n");
+        return -1;
     }
     
     printf("DEBUG: Detected START condition\n");
     
-    // Now SCL should go low
-    while (gpioRead(config->scl_pin) == 1) {
-        gpioDelay(config->bit_delay);
+    // Now SCL should go low with timeout
+    timeout_count = 0;
+    while (gpiod_line_get_value(config->scl_line) == 1 && timeout_count < 1000) {
+        usleep(config->bit_delay);
+        timeout_count++;
+    }
+    
+    if (timeout_count >= 1000) {
+        printf("DEBUG: Timeout waiting for SCL low after START\n");
+        return -1;
     }
     
     printf("DEBUG: SCL went low after START\n");
     
-    // Read 7-bit address + R/W bit
+    // Read 7-bit address + R/W bit with timeout
     for (i = 7; i >= 0; i--) {
-        while (gpioRead(config->scl_pin) == 0) {
-            gpioDelay(config->bit_delay / 2);
+        // Wait for SCL high
+        timeout_count = 0;
+        while (gpiod_line_get_value(config->scl_line) == 0 && timeout_count < 1000) {
+            usleep(config->bit_delay / 2);
+            timeout_count++;
         }
         
-        int bit = gpioRead(config->sda_pin);
+        if (timeout_count >= 1000) {
+            printf("DEBUG: Timeout waiting for SCL high during address read\n");
+            return -1;
+        }
+        
+        int bit = gpiod_line_get_value(config->sda_line);
         printf("DEBUG: Read bit %d = %d\n", i, bit);
         
         if (bit) {
             address |= (1 << i);
         }
         
-        while (gpioRead(config->scl_pin) == 1) {
-            gpioDelay(config->bit_delay / 2);
+        // Wait for SCL low
+        timeout_count = 0;
+        while (gpiod_line_get_value(config->scl_line) == 1 && timeout_count < 1000) {
+            usleep(config->bit_delay / 2);
+            timeout_count++;
+        }
+        
+        if (timeout_count >= 1000) {
+            printf("DEBUG: Timeout waiting for SCL low during address read\n");
+            return -1;
         }
     }
     
@@ -274,24 +374,38 @@ int i2c_slave_listen(I2C_Config *config) {
     printf("DEBUG: Address match, sending ACK\n");
     
     // Send ACK
-    sda_set_mode(config, PI_OUTPUT);
-    gpioWrite(config->sda_pin, 0); // ACK
+    sda_set_mode(config, 0);
+    gpiod_line_set_value(config->sda_line, 0); // ACK
     
-    // Wait for SCL to go high
-    gpioSetMode(config->scl_pin, PI_INPUT);
-    while (gpioRead(config->scl_pin) == 0) {
-        gpioDelay(config->bit_delay / 2);
+    // Wait for SCL to go high with timeout
+    scl_set_mode(config, 1);
+    timeout_count = 0;
+    while (gpiod_line_get_value(config->scl_line) == 0 && timeout_count < 1000) {
+        usleep(config->bit_delay / 2);
+        timeout_count++;
     }
     
-    // Wait for SCL to go low
-    while (gpioRead(config->scl_pin) == 1) {
-        gpioDelay(config->bit_delay / 2);
+    if (timeout_count >= 1000) {
+        printf("DEBUG: Timeout waiting for SCL high during ACK\n");
+        return -1;
+    }
+    
+    // Wait for SCL to go low with timeout
+    timeout_count = 0;
+    while (gpiod_line_get_value(config->scl_line) == 1 && timeout_count < 1000) {
+        usleep(config->bit_delay / 2);
+        timeout_count++;
+    }
+    
+    if (timeout_count >= 1000) {
+        printf("DEBUG: Timeout waiting for SCL low during ACK\n");
+        return -1;
     }
     
     printf("DEBUG: ACK bit clocked\n");
     
     // Release SDA
-    gpioWrite(config->sda_pin, 1);
+    gpiod_line_set_value(config->sda_line, 1);
     
     printf("DEBUG: i2c_slave_listen returning %d\n", read_write_bit);
     
@@ -305,18 +419,18 @@ int i2c_slave_read_byte(I2C_Config *config) {
     
     printf("DEBUG: i2c_slave_read_byte - Starting\n");
     
-    sda_set_mode(config, PI_INPUT);
-    gpioSetMode(config->scl_pin, PI_INPUT);
+    sda_set_mode(config, 1);
+    scl_set_mode(config, 1);
     
     // Read 8 bits
     for (i = 7; i >= 0; i--) {
         // Wait for SCL to go high
-        while (gpioRead(config->scl_pin) == 0) {
-            gpioDelay(config->bit_delay / 2);
+        while (gpiod_line_get_value(config->scl_line) == 0) {
+            usleep(config->bit_delay / 2);
         }
         
         // Read bit
-        int bit = gpioRead(config->sda_pin);
+        int bit = gpiod_line_get_value(config->sda_line);
         printf("DEBUG: i2c_slave_read_byte - Bit %d = %d\n", i, bit);
         
         if (bit) {
@@ -324,28 +438,28 @@ int i2c_slave_read_byte(I2C_Config *config) {
         }
         
         // Wait for SCL to go low
-        while (gpioRead(config->scl_pin) == 1) {
-            gpioDelay(config->bit_delay / 2);
+        while (gpiod_line_get_value(config->scl_line) == 1) {
+            usleep(config->bit_delay / 2);
         }
     }
     
     // Send ACK
     printf("DEBUG: i2c_slave_read_byte - Sending ACK\n");
-    sda_set_mode(config, PI_OUTPUT);
-    gpioWrite(config->sda_pin, 0); // ACK
+    sda_set_mode(config, 0);
+    gpiod_line_set_value(config->sda_line, 0); // ACK
     
     // Wait for SCL to go high then low (clock ACK bit)
-    gpioSetMode(config->scl_pin, PI_INPUT);
-    while (gpioRead(config->scl_pin) == 0) {
-        gpioDelay(config->bit_delay / 2);
+    scl_set_mode(config, 1);
+    while (gpiod_line_get_value(config->scl_line) == 0) {
+        usleep(config->bit_delay / 2);
     }
-    while (gpioRead(config->scl_pin) == 1) {
-        gpioDelay(config->bit_delay / 2);
+    while (gpiod_line_get_value(config->scl_line) == 1) {
+        usleep(config->bit_delay / 2);
     }
     
     // Release SDA
-    gpioWrite(config->sda_pin, 1);
-    sda_set_mode(config, PI_INPUT);
+    gpiod_line_set_value(config->sda_line, 1);
+    sda_set_mode(config, 1);
     
     printf("DEBUG: i2c_slave_read_byte - Completed, read 0x%02X\n", byte);
     
@@ -357,39 +471,37 @@ int i2c_slave_read_byte_with_stop_check(I2C_Config *config, uint8_t *byte) {
     int i;
     *byte = 0;
     
-    /// Todo
-    config->bit_delay=10;
-    printf("!DEBUG: i2c_slave_read_byte_with_stop_check, bit_delay: %d - Starting\n", config->bit_delay);
+    printf("DEBUG: i2c_slave_read_byte_with_stop_check, bit_delay: %d - Starting\n", config->bit_delay);
     
-    sda_set_mode(config, PI_INPUT);
-    gpioSetMode(config->scl_pin, PI_INPUT);
+    sda_set_mode(config, 1);
+    scl_set_mode(config, 1);
     
     // Check for STOP condition (SDA rising while SCL high)
-    while (gpioRead(config->scl_pin) == 1) {
-        if (gpioRead(config->sda_pin) == 0) {
+    while (gpiod_line_get_value(config->scl_line) == 1) {
+        if (gpiod_line_get_value(config->sda_line) == 0) {
             int prev_sda = 0;
-            while (gpioRead(config->scl_pin) == 1) {
-                int current_sda = gpioRead(config->sda_pin);
+            while (gpiod_line_get_value(config->scl_line) == 1) {
+                int current_sda = gpiod_line_get_value(config->sda_line);
                 if (prev_sda == 0 && current_sda == 1) {
                     printf("DEBUG: i2c_slave_read_byte_with_stop_check - STOP detected\n");
                     return 0; // STOP condition
                 }
                 prev_sda = current_sda;
-                gpioDelay(config->bit_delay / 10);
+                usleep(config->bit_delay / 10);
             }
         }
-        gpioDelay(config->bit_delay / 10);
+        usleep(config->bit_delay / 10);
     }
     
     // Read 8 bits
     for (i = 7; i >= 0; i--) {
         // Wait for SCL to go high
-        while (gpioRead(config->scl_pin) == 0) {
-            gpioDelay(config->bit_delay / 2);
+        while (gpiod_line_get_value(config->scl_line) == 0) {
+            usleep(config->bit_delay / 2);
         }
         
         // Read bit
-        int bit = gpioRead(config->sda_pin);
+        int bit = gpiod_line_get_value(config->sda_line);
         printf("DEBUG: i2c_slave_read_byte_with_stop_check - Bit %d = %d, bit_delay: %d\n", i, bit, config->bit_delay);
         
         if (bit) {
@@ -397,28 +509,28 @@ int i2c_slave_read_byte_with_stop_check(I2C_Config *config, uint8_t *byte) {
         }
         
         // Wait for SCL to go low
-        while (gpioRead(config->scl_pin) == 1) {
-            gpioDelay(config->bit_delay / 2);
+        while (gpiod_line_get_value(config->scl_line) == 1) {
+            usleep(config->bit_delay / 2);
         }
     }
     
     // Send ACK
     printf("DEBUG: i2c_slave_read_byte_with_stop_check - Sending ACK\n");
-    sda_set_mode(config, PI_OUTPUT);
-    gpioWrite(config->sda_pin, 0); // ACK
+    sda_set_mode(config, 0);
+    gpiod_line_set_value(config->sda_line, 0); // ACK
     
     // Wait for SCL to go high then low (clock ACK bit)
-    gpioSetMode(config->scl_pin, PI_INPUT);
-    while (gpioRead(config->scl_pin) == 0) {
-        gpioDelay(config->bit_delay / 2);
+    scl_set_mode(config, 1);
+    while (gpiod_line_get_value(config->scl_line) == 0) {
+        usleep(config->bit_delay / 2);
     }
-    while (gpioRead(config->scl_pin) == 1) {
-        gpioDelay(config->bit_delay / 2);
+    while (gpiod_line_get_value(config->scl_line) == 1) {
+        usleep(config->bit_delay / 2);
     }
     
     // Release SDA
-    gpioWrite(config->sda_pin, 1);
-    sda_set_mode(config, PI_INPUT);
+    gpiod_line_set_value(config->sda_line, 1);
+    sda_set_mode(config, 1);
     
     printf("DEBUG: i2c_slave_read_byte_with_stop_check - Read 0x%02X\n", *byte);
     
@@ -432,44 +544,44 @@ int i2c_slave_write_byte(I2C_Config *config, uint8_t byte) {
     
     printf("DEBUG: i2c_slave_write_byte - Starting, writing 0x%02X\n", byte);
     
-    sda_set_mode(config, PI_OUTPUT);
-    gpioSetMode(config->scl_pin, PI_INPUT);
+    sda_set_mode(config, 0);
+    scl_set_mode(config, 1);
     
     // Write 8 bits
     for (i = 7; i >= 0; i--) {
         // Set SDA according to bit
         int bit = (byte >> i) & 1;
-        gpioWrite(config->sda_pin, bit);
+        gpiod_line_set_value(config->sda_line, bit);
         printf("DEBUG: i2c_slave_write_byte - Bit %d = %d\n", i, bit);
         
         // Wait for SCL to go high
-        while (gpioRead(config->scl_pin) == 0) {
-            gpioDelay(config->bit_delay / 2);
+        while (gpiod_line_get_value(config->scl_line) == 0) {
+            usleep(config->bit_delay / 2);
         }
         
         // Wait for SCL to go low
-        while (gpioRead(config->scl_pin) == 1) {
-            gpioDelay(config->bit_delay / 2);
+        while (gpiod_line_get_value(config->scl_line) == 1) {
+            usleep(config->bit_delay / 2);
         }
     }
     
     // Release SDA to read ACK
     printf("DEBUG: i2c_slave_write_byte - Waiting for ACK\n");
-    gpioWrite(config->sda_pin, 1);
-    sda_set_mode(config, PI_INPUT);
+    gpiod_line_set_value(config->sda_line, 1);
+    sda_set_mode(config, 1);
     
     // Wait for SCL to go high
-    while (gpioRead(config->scl_pin) == 0) {
-        gpioDelay(config->bit_delay / 2);
+    while (gpiod_line_get_value(config->scl_line) == 0) {
+        usleep(config->bit_delay / 2);
     }
     
     // Read ACK bit
-    ack = gpioRead(config->sda_pin);
+    ack = gpiod_line_get_value(config->sda_line);
     printf("DEBUG: i2c_slave_write_byte - ACK bit = %d (0=ACK, 1=NACK)\n", ack);
     
     // Wait for SCL to go low
-    while (gpioRead(config->scl_pin) == 1) {
-        gpioDelay(config->bit_delay / 2);
+    while (gpiod_line_get_value(config->scl_line) == 1) {
+        usleep(config->bit_delay / 2);
     }
     
     printf("DEBUG: i2c_slave_write_byte - Completed, returning %d\n", (ack == 0) ? 0 : -1);
