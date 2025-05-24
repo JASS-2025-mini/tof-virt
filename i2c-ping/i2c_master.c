@@ -6,8 +6,8 @@
 #include <signal.h>
 #include "soft_i2c.h"
 
-#define SDA_PIN 20  // GPIO pin for SDA (alternative pins)
-#define SCL_PIN 21  // GPIO pin for SCL (alternative pins)
+#define SDA_PIN 17  // GPIO pin for SDA 
+#define SCL_PIN 27  // GPIO pin for SCL
 #define SLAVE_ADDR 0x42  // I2C address of slave device
 
 volatile int running = 1;

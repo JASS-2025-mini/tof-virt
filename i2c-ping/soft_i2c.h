@@ -22,6 +22,12 @@ typedef struct {
 // Initialize software I2C with given configuration
 int i2c_init(I2C_Config *config);
 
+// Initialize software I2C for slave (input mode)
+int i2c_init_slave(I2C_Config *config);
+
+// Helper function for slave to send ACK
+int i2c_slave_send_ack(I2C_Config *config, int ack);
+
 // Clean up resources
 void i2c_cleanup(I2C_Config *config);
 

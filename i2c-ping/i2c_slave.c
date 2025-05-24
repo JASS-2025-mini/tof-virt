@@ -6,8 +6,8 @@
 #include <signal.h>
 #include "soft_i2c.h"
 
-#define SDA_PIN 20  // GPIO pin for SDA (alternative pins)
-#define SCL_PIN 21  // GPIO pin for SCL (alternative pins)
+#define SDA_PIN 17  // GPIO pin for SDA 
+#define SCL_PIN 27  // GPIO pin for SCL
 #define MY_ADDR 0x42  // I2C address of this slave device
 
 volatile int running = 1;
@@ -35,7 +35,7 @@ int main(int argc, char *argv[]) {
     config.bit_delay = 2000;  // 2000 microseconds delay for better stability
     
     // Initialize I2C
-    if (i2c_init(&config) < 0) {
+    if (i2c_init_slave(&config) < 0) {
         fprintf(stderr, "Failed to initialize I2C\n");
         return 1;
     }
