@@ -224,9 +224,8 @@ Transaction 3: WRITE - Reg 0x00 = 0x01 (start measurement)
 | 100μs | 56.7% | Too fast, many missed STARTs |
 | 500μs | 60.0% | Still unreliable |
 | 1000μs | 76.7% | Better but not stable |
-| 1350μs | Testing... | Approaching 100%? |
-| 1400μs | 97.6% | New record! |
-| 1500μs | 92.8% | Very good |
+| 1400μs | 97.6% | best |
+| 1500μs | 92.8% | good |
 | 1750μs | 81.2% | Worse than 1500μs |
 | 2000μs | 86.8% | Good but not perfect |
 | 3000μs | 4.0% | Too slow, misses transactions |
