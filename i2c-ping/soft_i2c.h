@@ -55,4 +55,7 @@ uint64_t get_timestamp_ms(void);
 // Debug function
 void i2c_debug_status(I2C_Config *config);
 
+// Bus recovery
+void i2c_bus_recovery(I2C_Config *config);
+
 #endif // SOFT_I2C_H

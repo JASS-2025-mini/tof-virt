@@ -6,30 +6,7 @@
 #include <signal.h>
 #include <time.h>
 #include "soft_i2c.h"
-
-#define SDA_PIN 22  // GPIO pin for SDA
-#define SCL_PIN 23  // GPIO pin for SCL
-#define VL53L0X_ADDR 0x29  // VL53L0X I2C address
-
-// Timing constants
-#define START_WAIT_TIMEOUT  100000  // Timeout for waiting START condition
-#define START_WAIT_DELAY    10      // Delay in microseconds for START detection
-#define SCL_STABLE_COUNT    10      // Number of stable SCL readings required
-#define DATA_CHECK_LOOPS    100     // Loops to check for incoming data
-#define RETRY_DELAY_US      1000    // Delay before retry in microseconds
-#define MAX_TRANSACTIONS    5       // Re-sync after this many transactions
-
-// VL53L0X Register addresses
-#define VL53L0X_REG_IDENTIFICATION_MODEL_ID     0xC0
-#define VL53L0X_REG_IDENTIFICATION_REVISION_ID  0xC2
-#define VL53L0X_REG_SYSRANGE_START              0x00
-#define VL53L0X_REG_RESULT_INTERRUPT_STATUS     0x13
-#define VL53L0X_REG_RESULT_RANGE_STATUS         0x14
-#define VL53L0X_REG_RESULT_RANGE_VAL            0x1E
-
-// VL53L0X expected values
-#define VL53L0X_MODEL_ID    0xEE
-#define VL53L0X_REVISION_ID 0x10
+#include "vl53l0x_io.h"
 
 volatile int running = 1;
 
@@ -127,6 +104,7 @@ int main(int argc, char *argv[]) {
     
     I2C_Config config;
     int transaction_count = 0;
+    int consecutive_failures = 0;
     
     signal(SIGINT, handle_signal);
     
@@ -134,7 +112,7 @@ int main(int argc, char *argv[]) {
     config.sda_pin = SDA_PIN;
     config.scl_pin = SCL_PIN;
     config.slave_address = VL53L0X_ADDR;
-    config.bit_delay = 2000;
+    config.bit_delay = I2C_BIT_DELAY_US;
     
     // Initialize I2C as slave
     if (i2c_init_slave(&config) < 0) {
@@ -152,16 +130,26 @@ int main(int argc, char *argv[]) {
     printf("Initial distance: %d mm\n\n", distance_mm);
     
     while (running) {
-        // Quick sync before each transaction
-        usleep(RETRY_DELAY_US);  // 1ms sync pause
+        // Sync pause before listening
+        usleep(RETRY_DELAY_US);
         
-        // Just use slave listen without wait_for_start
+        // Listen for transaction
         int result = i2c_slave_listen(&config);
         if (result < 0) {
-            // No valid transaction detected, silent retry
+            // No valid transaction detected
+            consecutive_failures++;
+            if (consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
+                printf("Too many failures, forcing bus recovery...\n");
+                // Wait for bus to be idle
+                usleep(RETRY_DELAY_US * 10);
+                consecutive_failures = 0;
+            }
             usleep(RETRY_DELAY_US);
             continue;
         }
+        
+        // Reset failure counter on success
+        consecutive_failures = 0;
         
         transaction_count++;
         printf("Transaction %d: ", transaction_count);
@@ -248,6 +236,8 @@ int main(int argc, char *argv[]) {
             printf("ERROR: Failed to set SDA to input mode\n");
         }
         
+        // Small pause after successful transaction
+        usleep(POST_TRANSACTION_DELAY_US);
     }
     
     printf("\nCleaning up...\n");

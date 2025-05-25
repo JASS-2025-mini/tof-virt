@@ -5,21 +5,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include "soft_i2c.h"
-
-#define SDA_PIN 22  // GPIO pin for SDA
-#define SCL_PIN 23  // GPIO pin for SCL
-#define VL53L0X_ADDR 0x29  // VL53L0X I2C address
-#define MAX_MEASUREMENTS 4  // Number of measurements to perform
-#define WRITE_READ_DELAY_US 10000  // Delay between write and read operations in microseconds
-#define MEASUREMENT_DELAY_US 50000  // Delay for measurement completion in microseconds
-
-// VL53L0X Register addresses
-#define VL53L0X_REG_IDENTIFICATION_MODEL_ID     0xC0
-#define VL53L0X_REG_IDENTIFICATION_REVISION_ID  0xC2
-#define VL53L0X_REG_SYSRANGE_START              0x00
-#define VL53L0X_REG_RESULT_INTERRUPT_STATUS     0x13
-#define VL53L0X_REG_RESULT_RANGE_STATUS         0x14
-#define VL53L0X_REG_RESULT_RANGE_VAL            0x1E
+#include "vl53l0x_io.h"
 
 volatile int running = 1;
 
@@ -78,6 +64,7 @@ int main(int argc, char *argv[]) {
     uint8_t status;
     uint16_t distance_mm;
     int cycle = 0;
+    int successful_measurements = 0;
     
     signal(SIGINT, handle_signal);
     
@@ -85,7 +72,7 @@ int main(int argc, char *argv[]) {
     config.sda_pin = SDA_PIN;
     config.scl_pin = SCL_PIN;
     config.slave_address = VL53L0X_ADDR;
-    config.bit_delay = 2000;
+    config.bit_delay = I2C_BIT_DELAY_US;
     
     // Initialize I2C
     if (i2c_init(&config) < 0) {
@@ -112,10 +99,14 @@ int main(int argc, char *argv[]) {
     }
     
     printf("\n=== Starting Distance Measurements ===\n");
+    printf("Frequency: %d Hz, Period: %d ms\n", MEASUREMENT_FREQUENCY_HZ, MEASUREMENT_DELAY_US/1000);
     
     // Main measurement loop
     while (running && cycle < MAX_MEASUREMENTS) {
-        printf("\n--- Measurement Cycle %d ---\n", cycle++);
+        float current_success_rate = cycle > 0 ? (successful_measurements * 100.0) / cycle : 0.0;
+        printf("\n--- Measurement Cycle %d/%d (%.1f%%) - Success rate: %.1f%% ---\n", 
+               cycle + 1, MAX_MEASUREMENTS, ((cycle + 1) * 100.0) / MAX_MEASUREMENTS, current_success_rate);
+        cycle++;
         
         // Start single measurement
         printf("1. Starting measurement...\n");
@@ -148,13 +139,20 @@ int main(int argc, char *argv[]) {
         // Read distance measurement
         if (vl53l0x_read_distance(&config, &distance_mm) == 0) {
             printf("4. Distance: %d mm\n", distance_mm);
+            successful_measurements++;
         } else {
             printf("4. Failed to read distance\n");
         }
         
-        // Wait before next measurement
-        sleep(2);
+        // Small delay before next measurement
+        usleep(MEASUREMENT_DELAY_US);
     }
+    
+    printf("\n=== Test Results ===\n");
+    printf("Test frequency: %d Hz\n", MEASUREMENT_FREQUENCY_HZ);
+    printf("Actual iterations: %d\n", cycle);
+    printf("Successful: %d\n", successful_measurements);
+    printf("Success rate: %.1f%%\n", (successful_measurements * 100.0) / cycle);
     
     printf("\nCleaning up...\n");
     i2c_cleanup(&config);

@@ -625,3 +625,31 @@ void i2c_debug_status(I2C_Config *config) {
     int scl_state = gpiod_line_get_value(config->scl_line);
     printf("DEBUG: SDA=%d, SCL=%d\n", sda_state, scl_state);
 }
+
+// Bus recovery - generate 9 clock pulses to release stuck slave
+void i2c_bus_recovery(I2C_Config *config) {
+    printf("Performing I2C bus recovery...\n");
+    
+    // Ensure SDA is in input mode
+    sda_set_mode(config, 1);
+    
+    // Generate 9 clock pulses
+    for (int i = 0; i < 9; i++) {
+        gpiod_line_set_value(config->scl_line, 0);
+        usleep(config->bit_delay);
+        gpiod_line_set_value(config->scl_line, 1);
+        usleep(config->bit_delay);
+        
+        // Check if SDA is released
+        if (gpiod_line_get_value(config->sda_line) == 1) {
+            printf("Bus recovery: SDA released after %d clocks\n", i + 1);
+            break;
+        }
+    }
+    
+    // Generate STOP condition
+    i2c_stop(config);
+    
+    // Small delay to ensure bus is idle
+    usleep(config->bit_delay * 2);
+}
