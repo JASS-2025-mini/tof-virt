@@ -9,6 +9,9 @@
 #define SDA_PIN 22  // GPIO pin for SDA
 #define SCL_PIN 23  // GPIO pin for SCL
 #define VL53L0X_ADDR 0x29  // VL53L0X I2C address
+#define MAX_MEASUREMENTS 4  // Number of measurements to perform
+#define WRITE_READ_DELAY_US 10000  // Delay between write and read operations in microseconds
+#define MEASUREMENT_DELAY_US 50000  // Delay for measurement completion in microseconds
 
 // VL53L0X Register addresses
 #define VL53L0X_REG_IDENTIFICATION_MODEL_ID     0xC0
@@ -32,7 +35,7 @@ int vl53l0x_read_register(I2C_Config *config, uint8_t reg_addr, uint8_t *value) 
         return -1;
     }
     
-    usleep(1000);  // Small delay between write and read
+    usleep(WRITE_READ_DELAY_US);  // Delay between write and read for software I2C
     
     // Read register value
     if (i2c_master_read(config, value, 1) < 0) {
@@ -111,7 +114,7 @@ int main(int argc, char *argv[]) {
     printf("\n=== Starting Distance Measurements ===\n");
     
     // Main measurement loop
-    while (running) {
+    while (running && cycle < MAX_MEASUREMENTS) {
         printf("\n--- Measurement Cycle %d ---\n", cycle++);
         
         // Start single measurement
@@ -124,7 +127,7 @@ int main(int argc, char *argv[]) {
         
         // Wait for measurement to complete - simplified approach
         printf("2. Waiting for measurement completion...\n");
-        usleep(50000);  // Fixed 50ms delay for measurement
+        usleep(MEASUREMENT_DELAY_US);  // Fixed delay for measurement
         
         uint8_t interrupt_status = 0;
         if (vl53l0x_read_register(&config, VL53L0X_REG_RESULT_INTERRUPT_STATUS, &interrupt_status) < 0) {

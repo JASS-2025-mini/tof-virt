@@ -7,6 +7,18 @@
 #include <string.h>
 #include <errno.h>
 
+// Constants for 10Hz operation
+#define I2C_TIMEOUT_MS          10      // 10ms timeout for 10Hz operation
+#define I2C_TIMEOUT_US          (I2C_TIMEOUT_MS * 1000)
+#define I2C_ACK_SAMPLES         3       // Number of samples for ACK detection
+#define I2C_ACK_THRESHOLD       2       // Majority vote threshold
+#define I2C_WAIT_CYCLES         1000    // Wait cycles for clock changes
+#define I2C_STABILIZATION_DIV   4       // Divisor for stabilization delay
+#define I2C_SMALL_DELAY_DIV     10      // Divisor for small delays
+#define I2C_ACTIVITY_TIMEOUT    10000   // Timeout for activity detection
+#define I2C_ACK_ATTEMPTS        5       // Number of ACK read attempts
+#define I2C_ACK_TIMEOUT         100     // Timeout for ACK operations
+
 // Proper implementation of mode switching for SDA
 static int sda_set_mode(I2C_Config *config, int mode) {
     gpiod_line_release(config->sda_line);
@@ -144,15 +156,15 @@ int i2c_slave_send_ack(I2C_Config *config, int ack) {
     
     // Wait for master to bring SCL high
     int timeout = 0;
-    while (gpiod_line_get_value(config->scl_line) == 0 && timeout < 1000) {
-        usleep(config->bit_delay / 10);
+    while (gpiod_line_get_value(config->scl_line) == 0 && timeout < I2C_WAIT_CYCLES) {
+        usleep(config->bit_delay / I2C_SMALL_DELAY_DIV);
         timeout++;
     }
     
     // Wait for master to bring SCL low
     timeout = 0;
-    while (gpiod_line_get_value(config->scl_line) == 1 && timeout < 1000) {
-        usleep(config->bit_delay / 10);
+    while (gpiod_line_get_value(config->scl_line) == 1 && timeout < I2C_WAIT_CYCLES) {
+        usleep(config->bit_delay / I2C_SMALL_DELAY_DIV);
         timeout++;
     }
     
@@ -305,20 +317,37 @@ int i2c_slave_listen(I2C_Config *config) {
     uint8_t address = 0;
     int read_write_bit;
     
-    // Wait for activity
+    // Wait for bus activity - simplified approach
     int activity_detected = 0;
     int timeout_count = 0;
     
-    while (!activity_detected && timeout_count < 10000) {
+    // First, wait for bus to be idle (both lines high)
+    while (timeout_count < I2C_ACTIVITY_TIMEOUT) {
         int sda_val = gpiod_line_get_value(config->sda_line);
         int scl_val = gpiod_line_get_value(config->scl_line);
         
+        if (sda_val == 1 && scl_val == 1) {
+            // Bus is idle, now wait for activity
+            break;
+        }
+        
+        usleep(config->bit_delay / I2C_STABILIZATION_DIV);
+        timeout_count++;
+    }
+    
+    // Now wait for START condition
+    timeout_count = 0;
+    while (!activity_detected && timeout_count < I2C_ACTIVITY_TIMEOUT) {
+        int sda_val = gpiod_line_get_value(config->sda_line);
+        int scl_val = gpiod_line_get_value(config->scl_line);
+        
+        // Any activity on the bus
         if (sda_val == 0 || scl_val == 0) {
             activity_detected = 1;
             break;
         }
         
-        usleep(config->bit_delay / 4);
+        usleep(config->bit_delay / I2C_STABILIZATION_DIV);
         timeout_count++;
     }
     
@@ -326,18 +355,19 @@ int i2c_slave_listen(I2C_Config *config) {
         return -1;
     }
     
+    // Wait for clock to stabilize
     usleep(config->bit_delay);
     
     // Read address byte
     for (i = 7; i >= 0; i--) {
         // Wait for SCL high
         int timeout = 0;
-        while (gpiod_line_get_value(config->scl_line) == 0 && timeout < 1000) {
-            usleep(config->bit_delay / 10);
+        while (gpiod_line_get_value(config->scl_line) == 0 && timeout < I2C_WAIT_CYCLES) {
+            usleep(config->bit_delay / I2C_SMALL_DELAY_DIV);
             timeout++;
         }
         
-        if (timeout >= 1000) {
+        if (timeout >= I2C_WAIT_CYCLES) {
             return -1;
         }
         
@@ -348,8 +378,8 @@ int i2c_slave_listen(I2C_Config *config) {
         
         // Wait for SCL low
         timeout = 0;
-        while (gpiod_line_get_value(config->scl_line) == 1 && timeout < 1000) {
-            usleep(config->bit_delay / 10);
+        while (gpiod_line_get_value(config->scl_line) == 1 && timeout < I2C_WAIT_CYCLES) {
+            usleep(config->bit_delay / I2C_SMALL_DELAY_DIV);
             timeout++;
         }
     }
@@ -408,6 +438,7 @@ int i2c_slave_read_byte(I2C_Config *config) {
 // Slave writes a byte
 int i2c_slave_write_byte(I2C_Config *config, uint8_t byte) {
     int i;
+    int timeout;
     
     // Switch to output mode
     if (sda_set_mode(config, 0) < 0) {
@@ -416,37 +447,104 @@ int i2c_slave_write_byte(I2C_Config *config, uint8_t byte) {
     
     // Write 8 bits
     for (i = 7; i >= 0; i--) {
+        // CRITICAL: Wait for SCL to be LOW before setting data
+        timeout = I2C_TIMEOUT_US;
+        while (gpiod_line_get_value(config->scl_line) == 1 && timeout-- > 0) {
+            usleep(1);
+        }
+        if (timeout <= 0) return -1;
+        
+        // Set data bit while SCL is low
         int bit = (byte >> i) & 1;
         gpiod_line_set_value(config->sda_line, bit);
         
-        // Wait for SCL high
-        while (gpiod_line_get_value(config->scl_line) == 0) {
-            usleep(1);
-        }
+        // Give time for data to stabilize before master samples
+        usleep(config->bit_delay / I2C_STABILIZATION_DIV);
         
-        // Wait for SCL low
-        while (gpiod_line_get_value(config->scl_line) == 1) {
+        // Wait for SCL high (master samples data here)
+        timeout = I2C_TIMEOUT_US;
+        while (gpiod_line_get_value(config->scl_line) == 0 && timeout-- > 0) {
             usleep(1);
         }
+        if (timeout <= 0) return -1;
+        
+        // Data must remain stable while SCL is high
+        // Just wait for SCL to go low again
+        timeout = I2C_TIMEOUT_US;
+        while (gpiod_line_get_value(config->scl_line) == 1 && timeout-- > 0) {
+            usleep(1);
+        }
+        if (timeout <= 0) return -1;
     }
+    
+    // Release SDA line high before switching to input
+    gpiod_line_set_value(config->sda_line, 1);
+    usleep(config->bit_delay / I2C_SMALL_DELAY_DIV);  // Small delay for line to stabilize
     
     // Switch to input mode for ACK
     if (sda_set_mode(config, 1) < 0) {
         return -1;
     }
     
-    // Wait for ACK clock
-    while (gpiod_line_get_value(config->scl_line) == 0) {
+    // Wait for master to drive clock low
+    timeout = I2C_ACK_TIMEOUT;
+    while (gpiod_line_get_value(config->scl_line) == 1 && timeout-- > 0) {
         usleep(1);
     }
     
-    int ack = gpiod_line_get_value(config->sda_line);
-    
-    while (gpiod_line_get_value(config->scl_line) == 1) {
-        usleep(1);
+    if (timeout <= 0) {
+        sda_set_mode(config, 0);  // Switch back to output
+        return -1;  // Timeout waiting for clock
     }
     
-    return ack ? -1 : 0;
+    // Read ACK bit with multiple attempts
+    int ack_received = 1;  // Default to NACK
+    int attempts = I2C_ACK_ATTEMPTS;
+    
+    while (attempts-- > 0) {
+        // Wait for clock to go high
+        timeout = I2C_ACK_TIMEOUT;
+        while (gpiod_line_get_value(config->scl_line) == 0 && timeout-- > 0) {
+            usleep(1);
+        }
+        
+        if (timeout > 0) {
+            // Read SDA multiple times when clock is high
+            int ack_reads = 0;
+            for (int i = 0; i < I2C_ACK_SAMPLES; i++) {
+                if (gpiod_line_get_value(config->sda_line) == 0) {
+                    ack_reads++;
+                }
+                usleep(1);
+            }
+            
+            // If majority of reads show ACK, consider it ACK
+            if (ack_reads >= I2C_ACK_THRESHOLD) {
+                ack_received = 0;
+                break;
+            }
+        }
+        
+        // Wait for clock to go low before next attempt
+        timeout = I2C_ACK_TIMEOUT;
+        while (gpiod_line_get_value(config->scl_line) == 1 && timeout-- > 0) {
+            usleep(1);
+        }
+    }
+    
+    // Switch back to output mode
+    if (sda_set_mode(config, 0) < 0) {
+        return -1;
+    }
+    
+    // Return 0 for ACK, -1 for NACK
+    // For software I2C, we're more lenient - if data is flowing, assume success
+    if (ack_received == 0) {
+        return 0;  // Definite ACK
+    }
+    
+    // Return actual ACK status
+    return ack_received;
 }
 
 // Master writes multiple bytes

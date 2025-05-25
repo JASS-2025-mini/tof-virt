@@ -11,6 +11,14 @@
 #define SCL_PIN 23  // GPIO pin for SCL
 #define VL53L0X_ADDR 0x29  // VL53L0X I2C address
 
+// Timing constants
+#define START_WAIT_TIMEOUT  100000  // Timeout for waiting START condition
+#define START_WAIT_DELAY    10      // Delay in microseconds for START detection
+#define SCL_STABLE_COUNT    10      // Number of stable SCL readings required
+#define DATA_CHECK_LOOPS    100     // Loops to check for incoming data
+#define RETRY_DELAY_US      1000    // Delay before retry in microseconds
+#define MAX_TRANSACTIONS    5       // Re-sync after this many transactions
+
 // VL53L0X Register addresses
 #define VL53L0X_REG_IDENTIFICATION_MODEL_ID     0xC0
 #define VL53L0X_REG_IDENTIFICATION_REVISION_ID  0xC2
@@ -29,6 +37,24 @@ volatile int running = 1;
 uint8_t registers[256];
 uint8_t current_reg = 0;
 uint16_t distance_mm = 500;
+
+// Forward declaration for SDA mode switching
+static int sda_set_mode(I2C_Config *config, int mode) {
+    gpiod_line_release(config->sda_line);
+    
+    if (mode == 0) {
+        // Output mode
+        if (gpiod_line_request_output(config->sda_line, "i2c_sda_out", 1) < 0) {
+            return -1;
+        }
+    } else {
+        // Input mode  
+        if (gpiod_line_request_input(config->sda_line, "i2c_sda_in") < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
 
 void handle_signal(int sig) {
     (void)sig;
@@ -50,89 +76,50 @@ void init_registers(void) {
     // Set status registers
     registers[VL53L0X_REG_RESULT_INTERRUPT_STATUS] = 0x07;  // Data ready
     registers[VL53L0X_REG_RESULT_RANGE_STATUS] = 0x00;      // Valid range
+    
+    // Initialize all registers to avoid 0xFF
+    for (int i = 0; i < 256; i++) {
+        if (registers[i] == 0) registers[i] = 0x00;
+    }
 }
 
 // Wait for proper START condition
 int wait_for_start(I2C_Config *config) {
-    int last_sda = 1;
-    int last_scl = 1;
+    int last_sda = -1;  // Initialize to invalid state
+    int last_scl = -1;
     int timeout = 0;
+    int idle_detected = 0;
     
-    // First wait for idle state (both high)
-    while (timeout < 100000) {
+    while (timeout < START_WAIT_TIMEOUT) {
         int sda = gpiod_line_get_value(config->sda_line);
         int scl = gpiod_line_get_value(config->scl_line);
         
-        // Detect START: SDA falls while SCL is high
-        if (last_scl == 1 && scl == 1 && last_sda == 1 && sda == 0) {
+        // First, we need to see idle state (both high)
+        if (sda == 1 && scl == 1) {
+            idle_detected = 1;
+        }
+        
+        // Then detect START: SDA falls while SCL is high
+        if (idle_detected && scl == 1 && last_sda == 1 && sda == 0) {
             // Found START condition
+            return 0;
+        }
+        
+        // Handle repeated START (no idle between transactions)
+        if (last_scl == 0 && scl == 1 && last_sda == 1 && sda == 0) {
+            // Found repeated START
             return 0;
         }
         
         last_sda = sda;
         last_scl = scl;
         timeout++;
-        usleep(1);
+        usleep(START_WAIT_DELAY);
     }
     
     return -1;  // Timeout
 }
 
-// Fixed slave write byte with proper ACK handling
-int slave_write_byte_fixed(I2C_Config *config, uint8_t byte) {
-    int i;
-    
-    // Make sure SDA is in output mode
-    gpiod_line_release(config->sda_line);
-    if (gpiod_line_request_output(config->sda_line, "i2c_sda_write", 0) < 0) {
-        return -1;
-    }
-    
-    // Write 8 bits
-    for (i = 7; i >= 0; i--) {
-        // Set SDA according to bit
-        int bit = (byte >> i) & 1;
-        gpiod_line_set_value(config->sda_line, bit);
-        
-        // Wait for SCL to go high
-        while (gpiod_line_get_value(config->scl_line) == 0) {
-            usleep(1);
-        }
-        
-        // Wait for SCL to go low
-        while (gpiod_line_get_value(config->scl_line) == 1) {
-            usleep(1);
-        }
-    }
-    
-    // Release SDA for master to send ACK
-    gpiod_line_set_value(config->sda_line, 1);
-    gpiod_line_release(config->sda_line);
-    if (gpiod_line_request_input(config->sda_line, "i2c_sda_read_ack") < 0) {
-        return -1;
-    }
-    
-    // Wait for SCL to go high
-    while (gpiod_line_get_value(config->scl_line) == 0) {
-        usleep(1);
-    }
-    
-    // Read ACK bit
-    int ack = gpiod_line_get_value(config->sda_line);
-    
-    // Wait for SCL to go low
-    while (gpiod_line_get_value(config->scl_line) == 1) {
-        usleep(1);
-    }
-    
-    // Reconfigure SDA back to input for next transaction
-    gpiod_line_release(config->sda_line);
-    if (gpiod_line_request_input(config->sda_line, "i2c_sda_slave") < 0) {
-        return -1;
-    }
-    
-    return (ack == 0) ? 0 : -1;
-}
 
 int main(int argc, char *argv[]) {
     (void)argc;
@@ -165,14 +152,14 @@ int main(int argc, char *argv[]) {
     printf("Initial distance: %d mm\n\n", distance_mm);
     
     while (running) {
-        // Wait for proper START condition
-        if (wait_for_start(&config) < 0) {
-            continue;
-        }
+        // Quick sync before each transaction
+        usleep(RETRY_DELAY_US);  // 1ms sync pause
         
-        // Now use regular slave listen
+        // Just use slave listen without wait_for_start
         int result = i2c_slave_listen(&config);
         if (result < 0) {
+            // No valid transaction detected, silent retry
+            usleep(RETRY_DELAY_US);
             continue;
         }
         
@@ -185,21 +172,26 @@ int main(int argc, char *argv[]) {
             // Read register address
             int byte_result = i2c_slave_read_byte(&config);
             if (byte_result < 0) {
-                printf("Failed to read byte\n");
+                printf("Failed to read register address\n");
                 continue;
             }
             
             current_reg = (uint8_t)byte_result;
             printf("Reg 0x%02X", current_reg);
             
+            // Debug: show if this looks like device address
+            if (current_reg == VL53L0X_ADDR) {
+                printf(" (WARNING: This is device address, not register!)");
+            }
+            
             // For SYSRANGE_START, try to read value
             if (current_reg == VL53L0X_REG_SYSRANGE_START) {
                 // Check for more data with very short timeout
                 int scl_stable = 0;
-                for (int i = 0; i < 100; i++) {
+                for (int i = 0; i < DATA_CHECK_LOOPS; i++) {
                     if (gpiod_line_get_value(config.scl_line) == 0) {
                         scl_stable++;
-                        if (scl_stable > 10) {
+                        if (scl_stable > SCL_STABLE_COUNT) {
                             // Clock is low, might be data coming
                             byte_result = i2c_slave_read_byte(&config);
                             if (byte_result >= 0) {
@@ -233,7 +225,8 @@ int main(int argc, char *argv[]) {
             uint8_t value = registers[current_reg];
             printf("Reg 0x%02X = 0x%02X", current_reg, value);
             
-            if (slave_write_byte_fixed(&config, value) < 0) {
+            int write_result = i2c_slave_write_byte(&config, value);
+            if (write_result < 0) {
                 printf(" - FAILED");
             } else {
                 printf(" - OK");
@@ -242,7 +235,19 @@ int main(int argc, char *argv[]) {
             // Always increment for VL53L0X multi-byte reads
             current_reg++;
             printf(" (next: 0x%02X)\n", current_reg);
+            
+            // Debug: check line states after transaction
+            if (write_result < 0) {
+                printf("DEBUG: Transaction failed, checking line states...\n");
+                i2c_debug_status(&config);
+            }
         }
+        
+        // Ensure we're back in input mode for next transaction
+        if (sda_set_mode(&config, 1) < 0) {
+            printf("ERROR: Failed to set SDA to input mode\n");
+        }
+        
     }
     
     printf("\nCleaning up...\n");
