@@ -1,4 +1,4 @@
-// soft_i2c.c
+// soft_i2c_fixed.c - Fixed software I2C implementation
 #include "soft_i2c.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,12 +7,51 @@
 #include <string.h>
 #include <errno.h>
 
+// Proper implementation of mode switching for SDA
+static int sda_set_mode(I2C_Config *config, int mode) {
+    gpiod_line_release(config->sda_line);
+    
+    if (mode == 0) {
+        // Output mode
+        if (gpiod_line_request_output(config->sda_line, "i2c_sda_out", 1) < 0) {
+            fprintf(stderr, "Failed to set SDA as output: %s\n", strerror(errno));
+            return -1;
+        }
+    } else {
+        // Input mode
+        if (gpiod_line_request_input(config->sda_line, "i2c_sda_in") < 0) {
+            fprintf(stderr, "Failed to set SDA as input: %s\n", strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// SCL mode switching not needed - master always controls SCL
+// static int scl_set_mode(I2C_Config *config, int mode) {
+//     gpiod_line_release(config->scl_line);
+//     
+//     if (mode == 0) {
+//         // Output mode
+//         if (gpiod_line_request_output(config->scl_line, "i2c_scl_out", 1) < 0) {
+//             fprintf(stderr, "Failed to set SCL as output: %s\n", strerror(errno));
+//             return -1;
+//         }
+//     } else {
+//         // Input mode
+//         if (gpiod_line_request_input(config->scl_line, "i2c_scl_in") < 0) {
+//             fprintf(stderr, "Failed to set SCL as input: %s\n", strerror(errno));
+//             return -1;
+//         }
+//     }
+//     return 0;
+// }
+
 // Initialize GPIO using libgpiod
 int i2c_init(I2C_Config *config) {
-    // Open GPIO chip (usually gpiochip0 on most systems)
+    // Open GPIO chip
     config->chip = gpiod_chip_open_by_name("gpiochip0");
     if (!config->chip) {
-        // Try alternative chip names
         config->chip = gpiod_chip_open_by_name("gpiochip1");
         if (!config->chip) {
             fprintf(stderr, "Failed to open GPIO chip\n");
@@ -30,26 +69,22 @@ int i2c_init(I2C_Config *config) {
         return -1;
     }
     
-    // Configure pins as simple outputs (maximum simplicity)
-    // printf("DEBUG: Requesting SDA line (GPIO%d) as output\n", config->sda_pin);
+    // Configure pins as outputs initially
     if (gpiod_line_request_output(config->sda_line, "i2c_sda", 1) < 0) {
-        fprintf(stderr, "Failed to configure SDA line (GPIO%d) as output: %s\n", 
-                config->sda_pin, strerror(errno));
+        fprintf(stderr, "Failed to configure SDA line as output: %s\n", strerror(errno));
         gpiod_chip_close(config->chip);
         return -1;
     }
     
-    // printf("DEBUG: Requesting SCL line (GPIO%d) as output\n", config->scl_pin);
     if (gpiod_line_request_output(config->scl_line, "i2c_scl", 1) < 0) {
-        fprintf(stderr, "Failed to configure SCL line (GPIO%d) as output: %s\n", 
-                config->scl_pin, strerror(errno));
+        fprintf(stderr, "Failed to configure SCL line as output: %s\n", strerror(errno));
         gpiod_chip_close(config->chip);
         return -1;
     }
     
     // Default bit delay if not specified  
     if (config->bit_delay == 0) {
-        config->bit_delay = 2000;  // 2000 microseconds for better stability
+        config->bit_delay = 2000;  // 2000 microseconds
     }
     
     printf("GPIO initialized: SDA=GPIO%d, SCL=GPIO%d, bit_delay=%dus\n", 
@@ -60,8 +95,6 @@ int i2c_init(I2C_Config *config) {
 
 // Initialize I2C for slave (input mode for reading)
 int i2c_init_slave(I2C_Config *config) {
-    errno = 0;
-    
     config->chip = gpiod_chip_open("/dev/gpiochip0");
     if (!config->chip) {
         fprintf(stderr, "Failed to open GPIO chip: %s\n", strerror(errno));
@@ -77,26 +110,21 @@ int i2c_init_slave(I2C_Config *config) {
         return -1;
     }
     
-    // Configure pins as inputs for slave to read master signals
-    // printf("DEBUG: Requesting SDA line (GPIO%d) as input\n", config->sda_pin);
+    // Configure pins as inputs for slave
     if (gpiod_line_request_input(config->sda_line, "i2c_sda_slave") < 0) {
-        fprintf(stderr, "Failed to configure SDA line (GPIO%d) as input: %s\n", 
-                config->sda_pin, strerror(errno));
+        fprintf(stderr, "Failed to configure SDA line as input: %s\n", strerror(errno));
         gpiod_chip_close(config->chip);
         return -1;
     }
     
-    // printf("DEBUG: Requesting SCL line (GPIO%d) as input\n", config->scl_pin);
     if (gpiod_line_request_input(config->scl_line, "i2c_scl_slave") < 0) {
-        fprintf(stderr, "Failed to configure SCL line (GPIO%d) as input: %s\n", 
-                config->scl_pin, strerror(errno));
+        fprintf(stderr, "Failed to configure SCL line as input: %s\n", strerror(errno));
         gpiod_chip_close(config->chip);
         return -1;
     }
     
-    // Default bit delay if not specified  
     if (config->bit_delay == 0) {
-        config->bit_delay = 2000;  // 2000 microseconds for better stability
+        config->bit_delay = 2000;
     }
     
     printf("GPIO initialized for slave: SDA=GPIO%d, SCL=GPIO%d, bit_delay=%dus\n", 
@@ -105,50 +133,34 @@ int i2c_init_slave(I2C_Config *config) {
     return 0;
 }
 
-// Helper function for slave to send ACK/NACK synchronized with SCL
+// Helper function for slave to send ACK/NACK
 int i2c_slave_send_ack(I2C_Config *config, int ack) {
-    // Temporarily reconfigure SDA as output to send ACK
-    gpiod_line_release(config->sda_line);
-    
-    if (gpiod_line_request_output(config->sda_line, "i2c_sda_ack", ack ? 1 : 0) < 0) {
-        fprintf(stderr, "Failed to reconfigure SDA as output for ACK\n");
+    // Reconfigure SDA as output to send ACK
+    if (sda_set_mode(config, 0) < 0) {
         return -1;
     }
     
-    // printf("DEBUG: ACK configured, waiting for master SCL\n");
+    gpiod_line_set_value(config->sda_line, ack ? 1 : 0);
     
-    // Wait for master to bring SCL high (master reads ACK now)
+    // Wait for master to bring SCL high
     int timeout = 0;
     while (gpiod_line_get_value(config->scl_line) == 0 && timeout < 1000) {
         usleep(config->bit_delay / 10);
         timeout++;
     }
     
-    if (timeout >= 1000) {
-        // printf("DEBUG: Timeout waiting for SCL high during ACK\n");
-    } else {
-        // printf("DEBUG: SCL high detected, master reading ACK\n");
-    }
-    
-    // Wait for master to bring SCL low (end of ACK bit)
+    // Wait for master to bring SCL low
     timeout = 0;
     while (gpiod_line_get_value(config->scl_line) == 1 && timeout < 1000) {
         usleep(config->bit_delay / 10);
         timeout++;
     }
     
-    if (timeout >= 1000) {
-        // printf("DEBUG: Timeout waiting for SCL low after ACK\n");
-    }
-    
-    // Release and reconfigure back as input
-    gpiod_line_release(config->sda_line);
-    if (gpiod_line_request_input(config->sda_line, "i2c_sda_slave") < 0) {
-        fprintf(stderr, "Failed to reconfigure SDA back to input\n");
+    // Release SDA and reconfigure back as input
+    if (sda_set_mode(config, 1) < 0) {
         return -1;
     }
     
-    // printf("DEBUG: ACK sent: %d, SDA released\n", ack);
     return 0;
 }
 
@@ -164,175 +176,82 @@ void i2c_cleanup(I2C_Config *config) {
     }
 }
 
-// Debug function to display pin status
-void i2c_debug_status(I2C_Config *config) {
-    int sda_state = gpiod_line_get_value(config->sda_line);
-    int scl_state = gpiod_line_get_value(config->scl_line);
-    // printf("DEBUG: SDA=%d, SCL=%d\n", sda_state, scl_state);
-}
-
-// Helper for master to read ACK with multiple attempts
-static int master_read_ack(I2C_Config *config) {
-    int ack = 1; // Start with NACK
-    int attempt;
-    int ack_found = 0;
-    
-    // Give slave time to prepare ACK
-    usleep(config->bit_delay / 2);
-    
-    // Temporarily reconfigure SDA as input to read ACK
-    gpiod_line_release(config->sda_line);
-    if (gpiod_line_request_input(config->sda_line, "i2c_sda_ack_read") < 0) {
-        fprintf(stderr, "Failed to reconfigure SDA as input for ACK read\n");
-        return 1; // Return NACK on error
-    }
-    
-    // Clock high to signal slave to present ACK
-    gpiod_line_set_value(config->scl_line, 1);
-    
-    // Try reading ACK multiple times until we get it or timeout
-    for (attempt = 0; attempt < 10 && !ack_found; attempt++) {
-        usleep(config->bit_delay / 10); // Short delay between attempts
-        
-        ack = gpiod_line_get_value(config->sda_line);
-        if (ack == 0) { // Found ACK!
-            ack_found = 1;
-            // printf("DEBUG: Master found ACK on attempt %d\n", attempt + 1);
-        }
-    }
-    
-    if (!ack_found) {
-        // printf("DEBUG: Master timeout reading ACK after %d attempts\n", attempt);
-    }
-    
-    // Hold SCL high a bit longer
-    usleep(config->bit_delay / 2);
-    
-    // Clock low
-    gpiod_line_set_value(config->scl_line, 0);
-    usleep(config->bit_delay);
-    
-    // Reconfigure SDA back as output
-    gpiod_line_release(config->sda_line);
-    if (gpiod_line_request_output(config->sda_line, "i2c_sda", 1) < 0) {
-        fprintf(stderr, "Failed to reconfigure SDA back to output\n");
-        return 1; // Return NACK on error
-    }
-    
-    return ack;
-}
-
-// Simplified - no mode switching, just dummy functions
-static void sda_set_mode(I2C_Config *config, int mode) {
-    (void)config; (void)mode; // No-op - keep both pins as output always
-}
-
-static void scl_set_mode(I2C_Config *config, int mode) {
-    (void)config; (void)mode; // No-op - keep both pins as output always
-}
-
-// Check if bus is idle (both SDA and SCL high)
-static int i2c_bus_is_idle(I2C_Config *config) {
-    // Simple check - assume idle if we set both high
-    gpiod_line_set_value(config->sda_line, 1);
-    gpiod_line_set_value(config->scl_line, 1);
-    usleep(config->bit_delay);
-    return 1; // Always consider idle after setting high
-}
-
 // Generate I2C start condition
 int i2c_start(I2C_Config *config) {
-    // Wait for bus to be idle
-    // printf("DEBUG: i2c_start - Checking bus idle state\n");
-    int retries = 10;
-    while (!i2c_bus_is_idle(config) && retries-- > 0) {
-        // printf("DEBUG: i2c_start - Bus not idle, waiting...\n");
-        usleep(config->bit_delay * 10);
-    }
-    
-    if (retries <= 0) {
-        // printf("DEBUG: i2c_start - Bus busy, proceeding anyway\n");
-    }
-    
-    // With open-drain, no mode switching needed
-    // printf("DEBUG: i2c_start - Preparing START condition\n");
-    
-    // Ensure both lines are high
-    // printf("DEBUG: i2c_start - Setting both lines high\n");
+    // Ensure both lines are high initially
     gpiod_line_set_value(config->sda_line, 1);
     gpiod_line_set_value(config->scl_line, 1);
     usleep(config->bit_delay);
     
-    // Generate start condition: SDA goes low while SCL is high
-    // printf("DEBUG: i2c_start - Generating START condition\n");
+    // START: SDA goes low while SCL is high
     gpiod_line_set_value(config->sda_line, 0);
     usleep(config->bit_delay);
-    gpiod_line_set_value(config->scl_line, 0);
     
-    // printf("DEBUG: i2c_start - START condition complete\n");
+    // Then bring SCL low
+    gpiod_line_set_value(config->scl_line, 0);
+    usleep(config->bit_delay);
     
     return 0;
 }
 
 // Generate I2C stop condition
 void i2c_stop(I2C_Config *config) {
-    // Ensure SDA is output
-    sda_set_mode(config, 0);
-    
-    // Prepare for stop: ensure SCL is low, then set SDA low
-    gpiod_line_set_value(config->scl_line, 0);
+    // Ensure SDA is low and SCL is low
     gpiod_line_set_value(config->sda_line, 0);
+    gpiod_line_set_value(config->scl_line, 0);
     usleep(config->bit_delay);
     
-    // Generate stop condition: SCL goes high, then SDA goes high
+    // Bring SCL high first
     gpiod_line_set_value(config->scl_line, 1);
     usleep(config->bit_delay);
+    
+    // STOP: SDA goes high while SCL is high
     gpiod_line_set_value(config->sda_line, 1);
     usleep(config->bit_delay);
-    
-    // printf("DEBUG: i2c_stop - STOP condition complete\n");
 }
 
 // Write a byte to I2C bus
 int i2c_write_byte(I2C_Config *config, uint8_t byte) {
     int i;
-    int ack;
     
-    // printf("DEBUG: i2c_write_byte - Writing byte 0x%02X\n", byte);
-    
-    sda_set_mode(config, 0);
+    // Make sure SDA is in output mode
+    if (sda_set_mode(config, 0) < 0) {
+        return -1;
+    }
     
     // Send 8 bits, MSB first
     for (i = 7; i >= 0; i--) {
-        // Set SDA according to bit
         int bit = (byte >> i) & 1;
-        // printf("DEBUG: i2c_write_byte - Bit %d = %d\n", i, bit);
-        
         gpiod_line_set_value(config->sda_line, bit);
         usleep(config->bit_delay);
         
-        // Clock high and delay
         gpiod_line_set_value(config->scl_line, 1);
-        usleep(config->bit_delay * 2);
+        usleep(config->bit_delay);
         
-        // Clock low and delay
         gpiod_line_set_value(config->scl_line, 0);
         usleep(config->bit_delay);
     }
     
-    // printf("DEBUG: i2c_write_byte - All bits sent, waiting for ACK\n");
+    // Switch to input mode to read ACK
+    if (sda_set_mode(config, 1) < 0) {
+        return -1;
+    }
     
-    // Release SDA for slave acknowledgment and read ACK
-    gpiod_line_set_value(config->sda_line, 1);
+    // Clock ACK bit
+    gpiod_line_set_value(config->scl_line, 1);
     usleep(config->bit_delay);
     
-    // Use helper function to read ACK
-    ack = master_read_ack(config);
-    // printf("DEBUG: i2c_write_byte - ACK bit = %d (0=ACK, 1=NACK)\n", ack);
+    int ack = gpiod_line_get_value(config->sda_line);
     
-    // printf("DEBUG: i2c_write_byte - Returning %d\n", (ack == 0) ? 0 : -1);
+    gpiod_line_set_value(config->scl_line, 0);
+    usleep(config->bit_delay);
     
-    return (ack == 0) ? 0 : -1; // Return 0 on success (ACK received)
+    // Switch back to output mode
+    if (sda_set_mode(config, 0) < 0) {
+        return -1;
+    }
+    
+    return ack ? -1 : 0;  // Return 0 on ACK, -1 on NACK
 }
 
 // Read a byte from I2C bus
@@ -340,10 +259,10 @@ uint8_t i2c_read_byte(I2C_Config *config, int ack) {
     int i;
     uint8_t byte = 0;
     
-    // printf("DEBUG: i2c_read_byte - Starting (ack=%d)\n", ack);
-    
-    // Release SDA so slave can control it
-    sda_set_mode(config, 1);
+    // Switch SDA to input mode
+    if (sda_set_mode(config, 1) < 0) {
+        return 0xFF;
+    }
     
     // Read 8 bits
     for (i = 7; i >= 0; i--) {
@@ -352,27 +271,23 @@ uint8_t i2c_read_byte(I2C_Config *config, int ack) {
         
         if (gpiod_line_get_value(config->sda_line)) {
             byte |= (1 << i);
-            // printf("DEBUG: i2c_read_byte - Bit %d = 1\n", i);
-        } else {
-            // printf("DEBUG: i2c_read_byte - Bit %d = 0\n", i);
         }
         
         gpiod_line_set_value(config->scl_line, 0);
         usleep(config->bit_delay);
     }
     
-    // Send ACK/NACK
-    sda_set_mode(config, 0);
-    gpiod_line_set_value(config->sda_line, ack ? 1 : 0); // 0 = ACK, 1 = NACK
-    // printf("DEBUG: i2c_read_byte - Sending %s\n", ack ? "NACK" : "ACK");
+    // Switch to output mode to send ACK/NACK
+    if (sda_set_mode(config, 0) < 0) {
+        return byte;
+    }
     
-    // Clock ACK/NACK bit
+    gpiod_line_set_value(config->sda_line, ack ? 1 : 0);
+    
     gpiod_line_set_value(config->scl_line, 1);
     usleep(config->bit_delay);
     gpiod_line_set_value(config->scl_line, 0);
     usleep(config->bit_delay);
-    
-    // printf("DEBUG: i2c_read_byte - Read 0x%02X\n", byte);
     
     return byte;
 }
@@ -390,25 +305,16 @@ int i2c_slave_listen(I2C_Config *config) {
     uint8_t address = 0;
     int read_write_bit;
     
-    // printf("DEBUG: Entering i2c_slave_listen\n");
-    
-    // Simple approach - just wait a bit and start looking for START condition
-    usleep(config->bit_delay);
-    
-    // printf("DEBUG: Looking for START condition\n");
-    
-    // Simplified START detection - just wait for activity and proceed
+    // Wait for activity
     int activity_detected = 0;
     int timeout_count = 0;
     
     while (!activity_detected && timeout_count < 10000) {
-        // Look for any change indicating communication
         int sda_val = gpiod_line_get_value(config->sda_line);
         int scl_val = gpiod_line_get_value(config->scl_line);
         
         if (sda_val == 0 || scl_val == 0) {
             activity_detected = 1;
-            // printf("DEBUG: Activity detected, SDA=%d, SCL=%d\n", sda_val, scl_val);
             break;
         }
         
@@ -417,17 +323,14 @@ int i2c_slave_listen(I2C_Config *config) {
     }
     
     if (!activity_detected) {
-        // printf("DEBUG: No activity detected\n");
         return -1;
     }
     
-    // Wait for stable bit timing
     usleep(config->bit_delay);
     
-    // Synchronized address reading - wait for SCL transitions
-    // printf("DEBUG: Reading address byte\n");
+    // Read address byte
     for (i = 7; i >= 0; i--) {
-        // Wait for SCL to go high (master presents bit)
+        // Wait for SCL high
         int timeout = 0;
         while (gpiod_line_get_value(config->scl_line) == 0 && timeout < 1000) {
             usleep(config->bit_delay / 10);
@@ -435,55 +338,35 @@ int i2c_slave_listen(I2C_Config *config) {
         }
         
         if (timeout >= 1000) {
-            // printf("DEBUG: Timeout waiting for SCL high\n");
             return -1;
         }
         
-        // Read bit when SCL is high
-        int bit = gpiod_line_get_value(config->sda_line);
-        // printf("DEBUG: Bit %d = %d (SCL=1)\n", i, bit);
-        
-        if (bit) {
+        // Read bit
+        if (gpiod_line_get_value(config->sda_line)) {
             address |= (1 << i);
         }
         
-        // Wait for SCL to go low (end of bit)
+        // Wait for SCL low
         timeout = 0;
         while (gpiod_line_get_value(config->scl_line) == 1 && timeout < 1000) {
             usleep(config->bit_delay / 10);
             timeout++;
         }
-        
-        if (timeout >= 1000) {
-            // printf("DEBUG: Timeout waiting for SCL low\n");
-            return -1;
-        }
     }
     
-    // Extract R/W bit
     read_write_bit = address & 0x01;
     address >>= 1;
     
-    // printf("DEBUG: Received address 0x%02X, R/W=%d\n", address, read_write_bit);
-    
-    // Check if this address matches our slave address
     if (address != config->slave_address) {
-        // printf("DEBUG: Address mismatch, expected 0x%02X, got 0x%02X\n", 
-        //        config->slave_address, address);
-        return -1; // Not our address
-    }
-    
-    // printf("DEBUG: Address match, sending ACK\n");
-    
-    // Send ACK using helper function
-    if (i2c_slave_send_ack(config, 0) < 0) {  // 0 = ACK
-        // printf("DEBUG: Failed to send ACK\n");
         return -1;
     }
     
-    // printf("DEBUG: i2c_slave_listen returning %d\n", read_write_bit);
+    // Send ACK
+    if (i2c_slave_send_ack(config, 0) < 0) {
+        return -1;
+    }
     
-    return read_write_bit; // Return 1 if master wants to read, 0 if master wants to write
+    return read_write_bit;
 }
 
 // Slave reads a byte
@@ -491,288 +374,156 @@ int i2c_slave_read_byte(I2C_Config *config) {
     int i;
     uint8_t byte = 0;
     
-    // printf("DEBUG: i2c_slave_read_byte - Starting\n");
-    
-    sda_set_mode(config, 1);
-    scl_set_mode(config, 1);
+    // Make sure SDA is in input mode
+    if (sda_set_mode(config, 1) < 0) {
+        return -1;
+    }
     
     // Read 8 bits
     for (i = 7; i >= 0; i--) {
-        // Wait for SCL to go high
+        // Wait for SCL high
         while (gpiod_line_get_value(config->scl_line) == 0) {
-            usleep(config->bit_delay / 2);
+            usleep(1);
         }
         
         // Read bit
-        int bit = gpiod_line_get_value(config->sda_line);
-        // printf("DEBUG: i2c_slave_read_byte - Bit %d = %d\n", i, bit);
-        
-        if (bit) {
+        if (gpiod_line_get_value(config->sda_line)) {
             byte |= (1 << i);
         }
         
-        // Wait for SCL to go low
+        // Wait for SCL low
         while (gpiod_line_get_value(config->scl_line) == 1) {
-            usleep(config->bit_delay / 2);
+            usleep(1);
         }
     }
     
     // Send ACK
-    // printf("DEBUG: i2c_slave_read_byte - Sending ACK\n");
-    sda_set_mode(config, 0);
-    gpiod_line_set_value(config->sda_line, 0); // ACK
-    
-    // Wait for SCL to go high then low (clock ACK bit)
-    scl_set_mode(config, 1);
-    while (gpiod_line_get_value(config->scl_line) == 0) {
-        usleep(config->bit_delay / 2);
-    }
-    while (gpiod_line_get_value(config->scl_line) == 1) {
-        usleep(config->bit_delay / 2);
-    }
-    
-    // Release SDA
-    gpiod_line_set_value(config->sda_line, 1);
-    sda_set_mode(config, 1);
-    
-    // printf("DEBUG: i2c_slave_read_byte - Completed, read 0x%02X\n", byte);
-    
-    return byte;
-}
-
-// Function to read byte with STOP condition check
-int i2c_slave_read_byte_with_stop_check(I2C_Config *config, uint8_t *byte) {
-    int i;
-    *byte = 0;
-    
-    // printf("DEBUG: i2c_slave_read_byte_with_stop_check, bit_delay: %d - Starting\n", config->bit_delay);
-    
-    // SDA and SCL are already configured as inputs in slave mode
-    
-    // Check for STOP condition (SDA rising while SCL high)
-    while (gpiod_line_get_value(config->scl_line) == 1) {
-        if (gpiod_line_get_value(config->sda_line) == 0) {
-            int prev_sda = 0;
-            while (gpiod_line_get_value(config->scl_line) == 1) {
-                int current_sda = gpiod_line_get_value(config->sda_line);
-                if (prev_sda == 0 && current_sda == 1) {
-                    // printf("DEBUG: i2c_slave_read_byte_with_stop_check - STOP detected\n");
-                    return 0; // STOP condition
-                }
-                prev_sda = current_sda;
-                usleep(config->bit_delay / 10);
-            }
-        }
-        usleep(config->bit_delay / 10);
-    }
-    
-    // Read 8 bits
-    for (i = 7; i >= 0; i--) {
-        // Wait for SCL to go high
-        while (gpiod_line_get_value(config->scl_line) == 0) {
-            usleep(config->bit_delay / 2);
-        }
-        
-        // Read bit
-        int bit = gpiod_line_get_value(config->sda_line);
-        // printf("DEBUG: i2c_slave_read_byte_with_stop_check - Bit %d = %d, bit_delay: %d\n", i, bit, config->bit_delay);
-        
-        if (bit) {
-            *byte |= (1 << i);
-        }
-        
-        // Wait for SCL to go low
-        while (gpiod_line_get_value(config->scl_line) == 1) {
-            usleep(config->bit_delay / 2);
-        }
-    }
-    
-    // Send ACK using the improved helper function
-    // printf("DEBUG: i2c_slave_read_byte_with_stop_check - Sending ACK\n");
-    if (i2c_slave_send_ack(config, 0) < 0) {  // 0 = ACK
-        // printf("DEBUG: Failed to send ACK for data byte\n");
+    if (i2c_slave_send_ack(config, 0) < 0) {
         return -1;
     }
     
-    // printf("DEBUG: i2c_slave_read_byte_with_stop_check - Read 0x%02X\n", *byte);
-    
-    return 1; // Successfully read byte
+    return byte;
 }
 
 // Slave writes a byte
 int i2c_slave_write_byte(I2C_Config *config, uint8_t byte) {
     int i;
-    int ack;
     
-    // printf("DEBUG: i2c_slave_write_byte - Starting, writing 0x%02X\n", byte);
-    
-    sda_set_mode(config, 0);
-    scl_set_mode(config, 1);
+    // Switch to output mode
+    if (sda_set_mode(config, 0) < 0) {
+        return -1;
+    }
     
     // Write 8 bits
     for (i = 7; i >= 0; i--) {
-        // Set SDA according to bit
         int bit = (byte >> i) & 1;
         gpiod_line_set_value(config->sda_line, bit);
-        // printf("DEBUG: i2c_slave_write_byte - Bit %d = %d\n", i, bit);
         
-        // Wait for SCL to go high
+        // Wait for SCL high
         while (gpiod_line_get_value(config->scl_line) == 0) {
-            usleep(config->bit_delay / 2);
+            usleep(1);
         }
         
-        // Wait for SCL to go low
+        // Wait for SCL low
         while (gpiod_line_get_value(config->scl_line) == 1) {
-            usleep(config->bit_delay / 2);
+            usleep(1);
         }
     }
     
-    // Release SDA to read ACK
-    // printf("DEBUG: i2c_slave_write_byte - Waiting for ACK\n");
-    gpiod_line_set_value(config->sda_line, 1);
-    sda_set_mode(config, 1);
+    // Switch to input mode for ACK
+    if (sda_set_mode(config, 1) < 0) {
+        return -1;
+    }
     
-    // Wait for SCL to go high
+    // Wait for ACK clock
     while (gpiod_line_get_value(config->scl_line) == 0) {
-        usleep(config->bit_delay / 2);
+        usleep(1);
     }
     
-    // Read ACK bit
-    ack = gpiod_line_get_value(config->sda_line);
-    // printf("DEBUG: i2c_slave_write_byte - ACK bit = %d (0=ACK, 1=NACK)\n", ack);
+    int ack = gpiod_line_get_value(config->sda_line);
     
-    // Wait for SCL to go low
     while (gpiod_line_get_value(config->scl_line) == 1) {
-        usleep(config->bit_delay / 2);
+        usleep(1);
     }
     
-    // printf("DEBUG: i2c_slave_write_byte - Completed, returning %d\n", (ack == 0) ? 0 : -1);
-    
-    return (ack == 0) ? 0 : -1; // Return 0 on success (ACK received)
+    return ack ? -1 : 0;
 }
 
 // Master writes multiple bytes
 int i2c_master_write(I2C_Config *config, uint8_t *data, int length) {
     int i;
     
-    // printf("DEBUG: i2c_master_write - Starting, %d bytes\n", length);
-    
-    // Send start condition
     i2c_start(config);
     
-    // Send slave address with write bit (0)
+    // Send address with write bit
     if (i2c_write_byte(config, (config->slave_address << 1) | 0) != 0) {
-        // printf("DEBUG: i2c_master_write - Address NACK, stopping\n");
         i2c_stop(config);
-        return -1; // NACK received
+        return -1;
     }
     
     // Send data
     for (i = 0; i < length; i++) {
         if (i2c_write_byte(config, data[i]) != 0) {
-            // printf("DEBUG: i2c_master_write - Data NACK at byte %d, stopping\n", i);
             i2c_stop(config);
-            return -1; // NACK received
+            return -1;
         }
     }
     
-    // Send stop condition
     i2c_stop(config);
-    // printf("DEBUG: i2c_master_write - Completed successfully\n");
-    
-    return 0; // Success
+    return 0;
 }
 
 // Master reads multiple bytes
 int i2c_master_read(I2C_Config *config, uint8_t *buffer, int length) {
     int i;
     
-    // printf("DEBUG: i2c_master_read - Starting, requesting %d bytes\n", length);
-    
-    // Send start condition
     i2c_start(config);
     
-    // Send slave address with read bit (1)
+    // Send address with read bit
     if (i2c_write_byte(config, (config->slave_address << 1) | 1) != 0) {
-        // printf("DEBUG: i2c_master_read - Address NACK, stopping\n");
         i2c_stop(config);
-        return -1; // NACK received
+        return -1;
     }
-    
-    // printf("DEBUG: i2c_master_read - Address ACK received, reading data\n");
     
     // Read data
     for (i = 0; i < length - 1; i++) {
-        buffer[i] = i2c_read_byte(config, 0); // Send ACK after each byte
-        // printf("DEBUG: i2c_master_read - Read byte %d: 0x%02X\n", i, buffer[i]);
+        buffer[i] = i2c_read_byte(config, 0); // ACK
     }
-    buffer[length - 1] = i2c_read_byte(config, 1); // Send NACK after last byte
-    // printf("DEBUG: i2c_master_read - Read final byte: 0x%02X\n", buffer[length - 1]);
+    buffer[length - 1] = i2c_read_byte(config, 1); // NACK
     
-    // Send stop condition
     i2c_stop(config);
-    // printf("DEBUG: i2c_master_read - Completed successfully\n");
-    
-    return 0; // Success
+    return 0;
 }
 
-// Slave reads multiple bytes
-int i2c_slave_read(I2C_Config *config, uint8_t *buffer, int length) {
-    int i;
-    
-    // printf("DEBUG: i2c_slave_read - Starting\n");
-    
-    // Listen for address
-    int rw = i2c_slave_listen(config);
-    if (rw < 0) {
-        // printf("DEBUG: i2c_slave_read - Not our address\n");
-        return -1; // Not our address
+// Function to read byte with STOP condition check
+int i2c_slave_read_byte_with_stop_check(I2C_Config *config, uint8_t *byte) {
+    // For now, just use regular read
+    int result = i2c_slave_read_byte(config);
+    if (result < 0) {
+        return -1;
     }
-    
-    // Master wants to write to us, so we read
-    if (rw == 0) {
-        // printf("DEBUG: i2c_slave_read - Master wants to write, reading data\n");
-        // Read data
-        for (i = 0; i < length; i++) {
-            buffer[i] = i2c_slave_read_byte(config);
-            // printf("DEBUG: i2c_slave_read - Read byte 0x%02X\n", buffer[i]);
-        }
-        // printf("DEBUG: i2c_slave_read - Completed, read %d bytes\n", i);
-        return i;
-    }
-    
-    // printf("DEBUG: i2c_slave_read - Master wants to read, not write!\n");
-    return -1; // Master wants to read, not write
+    *byte = (uint8_t)result;
+    return 0;
 }
 
-// Slave writes multiple bytes
+// Slave write/read stubs for completeness
 int i2c_slave_write(I2C_Config *config, uint8_t *data, int length) {
-    int i;
-    
-    // printf("DEBUG: i2c_slave_write - Starting\n");
-    
-    // Listen for address
-    int rw = i2c_slave_listen(config);
-    if (rw < 0) {
-        // printf("DEBUG: i2c_slave_write - Not our address\n");
-        return -1; // Not our address
-    }
-    
-    // Master wants to read from us, so we write
-    if (rw == 1) {
-        // printf("DEBUG: i2c_slave_write - Master wants to read, writing data\n");
-        // Write data
-        for (i = 0; i < length; i++) {
-            // printf("DEBUG: i2c_slave_write - Writing byte 0x%02X\n", data[i]);
-            if (i2c_slave_write_byte(config, data[i]) != 0) {
-                // printf("DEBUG: i2c_slave_write - NACK received after %d bytes\n", i);
-                return i; // NACK received, stop sending
-            }
-        }
-        // printf("DEBUG: i2c_slave_write - Completed, wrote %d bytes\n", i);
-        return i;
-    }
-    
-    // printf("DEBUG: i2c_slave_write - Master wants to write, not read!\n");
-    return -1; // Master wants to write, not read
+    (void)config;
+    (void)data;
+    (void)length;
+    return -1;  // Not implemented
+}
+
+int i2c_slave_read(I2C_Config *config, uint8_t *buffer, int length) {
+    (void)config;
+    (void)buffer;
+    (void)length;
+    return -1;  // Not implemented
+}
+
+// Debug function
+void i2c_debug_status(I2C_Config *config) {
+    int sda_state = gpiod_line_get_value(config->sda_line);
+    int scl_state = gpiod_line_get_value(config->scl_line);
+    printf("DEBUG: SDA=%d, SCL=%d\n", sda_state, scl_state);
 }

@@ -6,8 +6,8 @@
 #include <signal.h>
 #include "soft_i2c.h"
 
-#define SDA_PIN 17  // GPIO pin for SDA
-#define SCL_PIN 27  // GPIO pin for SCL
+#define SDA_PIN 22  // GPIO pin for SDA
+#define SCL_PIN 23  // GPIO pin for SCL
 #define VL53L0X_ADDR 0x29  // VL53L0X I2C address
 
 // VL53L0X Register addresses
